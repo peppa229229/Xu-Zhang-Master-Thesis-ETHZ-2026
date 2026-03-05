@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+trap 'echo "[ERROR] Line $LINENO: command failed: $BASH_COMMAND" >&2' ERR
+
+############################################
+# ✅ USER PARAMETERS (edit only this block)
+############################################
+
+# 1) FASTQ folder to run TCRtoolbox on:
+#    Use your *merged* FASTQs directory from the rescue step, e.g.:
+#    /mnt/c/Users/peppa/Downloads/Connor_NextSeq_122425/rescued_output/merged_fastq
+FASTQ_DIR="/mnt/c/Users/peppa/Downloads/Connor_NextSeq_122425/rescued_output/merged_fastq"
+
+# 2) 2-column reference file (header allowed: ID  sequence)
+REF_TSV="/mnt/c/Users/peppa/Downloads/mageck_ref_before_RC.txt"
+
+# 3) Run name (used in output folder naming)
+RUN_NAME="run_merged"
+
+# 4) Use reverse-complement (RC) reference (true/false)
+USE_RC_REF="true"
+
+# 5) Aligner choice: minimap2 or bwa
+USE_MINIMAP2="false"   # true=minimap2, false=bwa
+
+# 6) Max mismatches allowed
+MAX_MISMATCHES="1"
+
+# 7) Threads
+THREADS="8"
+
+# 8) 3' end quality trimming threshold
+MIN_QUAL_3_END="31"
+
+# 9) Minimal overlap (min aligned length)
+MINIMAL_OVERLAP="106"
+
+# 10) Epitope-barcoded data (true/false)
+EPITOPE_BARCODE="false"
+
+# 11) Soft-clipping limits
+MAX_SOFT_5_END="50"
+MAX_SOFT_3_END="3"
+
+# 12) Base output dir (timestamped subfolder will be created)
+OUT_BASE="$HOME/tcr_runs"
+
+# 13) (Optional) Copy final matrix to Windows Downloads
+WIN_OUT_DIR="/mnt/c/Users/peppa/Downloads"
+
+############################################
+# ADVANCED (usually don’t change)
+############################################
+CONDA_ENV="py312-tcr-toolbox"
+TCRTOOLBOX_DIR="$HOME/TCRtoolbox"
+
+############################################
+# Sanity checks
+############################################
+: "${FASTQ_DIR:?FASTQ_DIR is not set}"
+: "${REF_TSV:?REF_TSV is not set}"
+: "${RUN_NAME:?RUN_NAME is not set}"
+: "${CONDA_ENV:?CONDA_ENV is not set}"
+: "${TCRTOOLBOX_DIR:?TCRTOOLBOX_DIR is not set}"
+
+if [[ ! -d "$FASTQ_DIR" ]]; then
+  echo "[ERROR] FASTQ_DIR does not exist: $FASTQ_DIR" >&2
+  exit 1
+fi
+if [[ ! -f "$REF_TSV" ]]; then
+  echo "[ERROR] REF_TSV does not exist: $REF_TSV" >&2
+  exit 1
+fi
+if [[ ! -d "$TCRTOOLBOX_DIR" ]]; then
+  echo "[ERROR] TCRTOOLBOX_DIR does not exist: $TCRTOOLBOX_DIR" >&2
+  exit 1
+fi
+if ! command -v conda >/dev/null 2>&1; then
+  echo "[ERROR] conda not found in PATH." >&2
+  exit 1
+fi
+
+############################################
+# Create run directories
+############################################
+timestamp=$(date +%Y%m%d_%H%M%S)
+RUN_DIR="${OUT_BASE}/${RUN_NAME}_${timestamp}"
+PROJECT_DIR="${RUN_DIR}/project"
+REF_DIR="${RUN_DIR}/ref"
+CONFIG_DIR="${RUN_DIR}/config"
+
+mkdir -p "$PROJECT_DIR" "$REF_DIR" "$CONFIG_DIR"
+
+echo "[INFO] Run dir: $RUN_DIR"
+echo "[INFO] FASTQ dir (merged): $FASTQ_DIR"
+echo "[INFO] REF TSV: $REF_TSV"
+
+############################################
+# 1) Activate conda environment
+############################################
+# shellcheck disable=SC1091
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV"
+
+############################################
+# 2) Reference TSV -> FASTA (auto-skip header)
+############################################
+REF_FA="${REF_DIR}/tcr_ref.fa"
+python - <<PY
+import re
+from pathlib import Path
+
+inp = Path(r"$REF_TSV")
+out = Path(r"$REF_FA")
+out.parent.mkdir(parents=True, exist_ok=True)
+
+seen=set()
+header_checked=False
+
+with inp.open() as f, out.open("w") as g:
+    for line_no, line in enumerate(f, 1):
+        line=line.strip()
+        if not line:
+            continue
+
+        # Skip header if it looks like "id/name ... seq/sequence"
+        if not header_checked:
+            low=line.lower()
+            if (("id" in low) or ("name" in low)) and ("seq" in low):
+                header_checked=True
+                continue
+            header_checked=True
+
+        parts=re.split(r"\s+", line)
+        if len(parts) < 2:
+            raise ValueError(f"Line {line_no} has <2 columns: {line}")
+        _id, seq = parts[0], parts[1].upper()
+
+        if _id in seen:
+            raise ValueError(f"Duplicate ID at line {line_no}: {_id}")
+        seen.add(_id)
+
+        g.write(f">{_id}\n{seq}\n")
+
+print("[INFO] Wrote FASTA:", out)
+print("[INFO] n =", len(seen))
+PY
+
+entries=$(grep -c '^>' "$REF_FA" || true)
+echo "[INFO] FASTA entries: $entries"
+if [[ "$entries" -eq 0 ]]; then
+  echo "[ERROR] Reference FASTA has 0 entries: $REF_FA" >&2
+  exit 1
+fi
+
+############################################
+# 3) Optional: build RC FASTA
+############################################
+REF_USED="$REF_FA"
+if [[ "$USE_RC_REF" == "true" ]]; then
+  REF_RC="${REF_DIR}/tcr_ref_rc.fa"
+  python - <<PY
+from pathlib import Path
+inp = Path(r"$REF_FA")
+out = Path(r"$REF_RC")
+comp = str.maketrans("ACGTNacgtn","TGCANtgcan")
+def rc(s): return s.translate(comp)[::-1]
+
+sid=None
+seq=[]
+with inp.open() as f, out.open("w") as g:
+    for line in f:
+        line=line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if sid is not None:
+                g.write(f">{sid}\n{rc(''.join(seq))}\n")
+            sid=line[1:].strip()
+            seq=[]
+        else:
+            seq.append(line)
+    if sid is not None:
+        g.write(f">{sid}\n{rc(''.join(seq))}\n")
+print("[INFO] Wrote RC FASTA:", out)
+PY
+  REF_USED="$REF_RC"
+fi
+echo "[INFO] Reference used: $REF_USED"
+
+############################################
+# 4) Link merged FASTQs into project_dir root (symlinks)
+############################################
+shopt -s nullglob
+n=0
+for f in "$FASTQ_DIR"/*.fastq.gz "$FASTQ_DIR"/*.fq.gz "$FASTQ_DIR"/*.txt.gz; do
+  base=$(basename "$f")
+  if [[ "$base" == *.txt.gz ]]; then
+    ln -sf "$f" "${PROJECT_DIR}/${base%.txt.gz}.fastq.gz"
+  else
+    ln -sf "$f" "${PROJECT_DIR}/${base}"
+  fi
+  n=$((n+1))
+done
+
+if [[ $n -eq 0 ]]; then
+  echo "[ERROR] No gz files found in $FASTQ_DIR" >&2
+  exit 1
+fi
+echo "[INFO] Linked $n files into $PROJECT_DIR"
+ls -lh "$PROJECT_DIR" | head
+
+############################################
+# 5) Write config.json (with your requested settings)
+############################################
+CONFIG_JSON="${CONFIG_DIR}/count_reads_bulk.json"
+python - <<PY
+import json
+from pathlib import Path
+
+cfg = {
+  "project_dir": r"$PROJECT_DIR",
+  "reference_file": r"$REF_USED",
+  "minimal_overlap": int("$MINIMAL_OVERLAP"),
+  "max_mismatches": int("$MAX_MISMATCHES"),
+  "max_soft_5_end": int("$MAX_SOFT_5_END"),
+  "max_soft_3_end": int("$MAX_SOFT_3_END"),
+  "use_minimap2": True if "$USE_MINIMAP2"=="true" else False,
+  "filter_secondary_alignments": True,
+  "remove_tmp_dir": True,
+  "threads": int("$THREADS"),
+  "bwa_index_algo": "is",
+  "epitope_barcode": True if "$EPITOPE_BARCODE"=="true" else False,
+  "max_insertion": 0,
+  "max_deletion": 0,
+  "min_quality_3_end": int("$MIN_QUAL_3_END"),
+  "minimap2_kmer_length": 19
+}
+
+out = Path(r"$CONFIG_JSON")
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(cfg, indent=2))
+print("[INFO] Wrote config:", out)
+PY
+
+echo "[INFO] Key config values:"
+grep -nE "project_dir|reference_file|minimal_overlap|max_mismatches|max_soft_5_end|max_soft_3_end|use_minimap2|threads|min_quality_3_end|epitope_barcode" "$CONFIG_JSON"
+
+############################################
+# 6) Run TCRtoolbox
+############################################
+cd "$TCRTOOLBOX_DIR"
+tcr_toolbox count-reads-bulk "$CONFIG_JSON"
+
+############################################
+# 7) Merge counts -> matrix (NO pandas required)
+############################################
+MATRIX="${RUN_DIR}/tcr_counts_matrix.csv"
+python - <<PY
+import csv, re
+from pathlib import Path
+
+project = Path(r"$PROJECT_DIR")
+counts_dir = project / "counts"
+files = sorted(counts_dir.glob("*_counts.csv"))
+if not files:
+    raise SystemExit(f"[ERROR] No *_counts.csv found under {counts_dir}")
+
+sample_to_counts = {}
+all_refs = set()
+
+for f in files:
+    name = f.name
+    sample = re.sub(r"_trimmed.*_counts\.csv$", "", name)
+    sample = sample.replace("_counts.csv", "")
+
+    # Prevent accidental overwrites
+    if sample in sample_to_counts:
+        k = 2
+        new_sample = f"{sample}__dup{k}"
+        while new_sample in sample_to_counts:
+            k += 1
+            new_sample = f"{sample}__dup{k}"
+        sample = new_sample
+
+    counts = {}
+    with f.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        if "reference_name" not in reader.fieldnames or "read_count" not in reader.fieldnames:
+            raise ValueError(f"[ERROR] Unexpected columns in {f}: {reader.fieldnames}")
+        for row in reader:
+            ref = row["reference_name"]
+            cnt = int(row["read_count"])
+            counts[ref] = cnt
+            all_refs.add(ref)
+
+    sample_to_counts[sample] = counts
+
+ref_list = sorted(all_refs)
+
+out = Path(r"$MATRIX")
+with out.open("w", newline="") as fh:
+    writer = csv.writer(fh)
+    header = ["reference_name"] + list(sample_to_counts.keys())
+    writer.writerow(header)
+    for ref in ref_list:
+        writer.writerow([ref] + [sample_to_counts[s].get(ref, 0) for s in sample_to_counts.keys()])
+
+print("[INFO] Wrote matrix:", out)
+print("[INFO] Rows (references):", len(ref_list))
+print("[INFO] Columns (samples):", len(sample_to_counts))
+PY
+
+############################################
+# 8) Copy matrix to Windows (optional)
+############################################
+if [[ -d "$WIN_OUT_DIR" ]]; then
+  cp "$MATRIX" "$WIN_OUT_DIR/"
+  echo "[INFO] Copied matrix to Windows: $WIN_OUT_DIR/$(basename "$MATRIX")"
+fi
+
+echo "[DONE] All finished."
+echo "[DONE] Matrix: $MATRIX"
