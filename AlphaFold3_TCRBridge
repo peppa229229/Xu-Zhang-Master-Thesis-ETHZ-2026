@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# CONFIG
+# =========================
+WIN_BASE="/mnt/c/Users/peppa/Downloads"
+PREFIX="n10_imp"
+RUN_IDS=(11 21 9 17 16 20 4 8)
+
+REPO_DIR="$HOME/TCRbridge"
+ENV_NAME="tcrbridge_env"
+
+# Headless (Qt/xcb-safe)
+export QT_QPA_PLATFORM=offscreen
+export MPLBACKEND=Agg
+unset DISPLAY || true
+
+# Conda bootstrap (optional but recommended)
+if [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
+  source "$HOME/miniforge3/etc/profile.d/conda.sh"
+  conda activate "$ENV_NAME" >/dev/null 2>&1 || true
+fi
+
+cd "$REPO_DIR"
+
+# Sanity checks
+test -f "$REPO_DIR/AlphaBridge/define_interfaces.py" || { echo "ERROR: missing $REPO_DIR/AlphaBridge/define_interfaces.py"; exit 1; }
+test -f "$REPO_DIR/tcrbridge/predict.py" || { echo "ERROR: missing $REPO_DIR/tcrbridge/predict.py"; exit 1; }
+
+mkdir -p "$REPO_DIR/af3_runs"
+
+# =========================
+# HELPERS
+# =========================
+wrap_flat_output_if_needed () {
+  local run_dir="$1"
+
+  # Flat AF3 output: fold_*_model_0.cif exists at top-level of run_dir
+  if compgen -G "$run_dir/fold_*_model_0.cif" > /dev/null; then
+    echo "==> Detected flat AF3 outputs in $run_dir. Wrapping into a job directory..."
+
+    local jr prefix jobdir
+    jr="$(ls "$run_dir"/fold_*_job_request.json 2>/dev/null | head -n 1 || true)"
+    if [[ -z "$jr" ]]; then
+      echo "ERROR: No fold_*_job_request.json found in $run_dir"
+      return 1
+    fi
+
+    prefix="$(basename "$jr" _job_request.json)"   # e.g. fold_n1_imp11
+    jobdir="$run_dir/$prefix"
+    mkdir -p "$jobdir"
+
+    # Move all files belonging to this job prefix
+    mv "$run_dir"/${prefix}_* "$jobdir"/
+
+    # Move msas/templates directories if present
+    if [[ -d "$run_dir/msas" ]]; then mv "$run_dir/msas" "$jobdir"/; fi
+    if [[ -d "$run_dir/templates" ]]; then mv "$run_dir/templates" "$jobdir"/; fi
+
+    echo "==> Wrapped into: $jobdir"
+  fi
+}
+
+discover_job_dirs () {
+  local run_dir="$1"
+  # Job dir = directory containing *_model_0.cif
+  find "$run_dir" -mindepth 1 -maxdepth 2 -type d -print | while read -r d; do
+    if compgen -G "$d/*_model_0.cif" > /dev/null; then
+      echo "$d"
+    fi
+  done
+}
+
+run_one () {
+  local rid="$1"
+  local run_name="${PREFIX}${rid}"
+  local win_dir="${WIN_BASE}/${run_name}"
+  local run_dir="${REPO_DIR}/af3_runs/${run_name}"
+  local out_csv="${REPO_DIR}/TCRbridge_predictions_${run_name}.csv"
+  local out_win="${WIN_BASE}/TCRbridge_predictions_${run_name}.csv"
+
+  echo
+  echo "=============================="
+  echo "RUN:     $run_name"
+  echo "INPUT:   $win_dir"
+  echo "WORKDIR: $run_dir"
+  echo "=============================="
+
+  if [[ ! -d "$win_dir" ]]; then
+    echo "ERROR: input directory not found: $win_dir"
+    return 2
+  fi
+
+  # 1) Copy AF3 outputs from Windows -> Linux workdir
+  rm -rf "$run_dir"
+  mkdir -p "$run_dir"
+  rsync -av --delete "$win_dir"/ "$run_dir"/ >/dev/null
+
+  # 2) Normalize layout (wrap flat outputs if needed)
+  wrap_flat_output_if_needed "$run_dir" || return 3
+
+  # 3) Discover job directories
+  mapfile -t job_dirs < <(discover_job_dirs "$run_dir")
+  if [[ ${#job_dirs[@]} -eq 0 ]]; then
+    echo "ERROR: no job directories found (expected *_model_0.cif inside a subdir)"
+    echo "Top files (maxdepth=2):"
+    find "$run_dir" -maxdepth 2 -type f | head -n 120
+    return 4
+  fi
+
+  printf "==> Found %d job(s):\n" "${#job_dirs[@]}"
+  printf "  - %s\n" "${job_dirs[@]}"
+
+  # 4) Run AlphaBridge on each job directory (creates AlphaBridge/alphabridge_data.json)
+  for d in "${job_dirs[@]}"; do
+    echo "---- AlphaBridge: $d"
+    python3 "$REPO_DIR/AlphaBridge/define_interfaces.py" -i "$d" >/dev/null
+    if [[ ! -f "$d/AlphaBridge/alphabridge_data.json" ]]; then
+      echo "ERROR: missing AlphaBridge output: $d/AlphaBridge/alphabridge_data.json"
+      return 5
+    fi
+  done
+
+  # 5) Satisfy predict.py input validation (expects run_dir/AlphaBridge to exist)
+  mkdir -p "$run_dir/AlphaBridge"
+
+  # 6) Run TCRbridge scoring (reads per-job AlphaBridge outputs)
+  python3 -m tcrbridge.predict -i "$run_dir" -o "$out_csv" >/dev/null
+
+  # 7) Copy predictions back to Windows
+  cp "$out_csv" "$out_win"
+
+  echo "==> DONE: $out_win"
+  return 0
+}
+
+# =========================
+# MAIN
+# =========================
+ok_list=()
+fail_list=()
+
+for rid in "${RUN_IDS[@]}"; do
+  if run_one "$rid"; then
+    ok_list+=("${PREFIX}${rid}")
+  else
+    fail_list+=("${PREFIX}${rid}")
+  fi
+done
+
+echo
+echo "========== RUN SUMMARY =========="
+echo "OK   : ${#ok_list[@]} -> ${ok_list[*]:-none}"
+echo "FAIL : ${#fail_list[@]} -> ${fail_list[*]:-none}"
+echo "================================="
+
+# =========================
+# SCORE SUMMARY (imp + score)
+# =========================
+SUMMARY_CSV="${WIN_BASE}/TCRbridge_score_summary_${PREFIX}.csv"
+
+python3 - <<PY
+import csv, glob, os, re
+
+win_base = r"$WIN_BASE"
+prefix = r"$PREFIX"
+pattern = os.path.join(win_base, f"TCRbridge_predictions_{prefix}*.csv")
+files = sorted(glob.glob(pattern))
+
+def imp_from_filename(fn: str):
+    m = re.search(rf"{re.escape(prefix)}(\\d+)", os.path.basename(fn))
+    return int(m.group(1)) if m else None
+
+rows = []
+for fp in files:
+    imp = imp_from_filename(fp)
+    if imp is None:
+        continue
+    with open(fp, newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames:
+            continue
+        if "tcr_id" not in r.fieldnames or "TCRbridge_score" not in r.fieldnames:
+            continue
+        for row in r:
+            rows.append({
+                "imp": imp,
+                "TCRbridge_score": row.get("TCRbridge_score","").strip(),
+                "tcr_id": row.get("tcr_id","").strip(),
+                "source_file": os.path.basename(fp),
+            })
+
+rows.sort(key=lambda x: (x["imp"], x["tcr_id"]))
+
+out_csv = r"$SUMMARY_CSV"
+with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=["imp","TCRbridge_score","tcr_id","source_file"])
+    w.writeheader()
+    w.writerows(rows)
+
+print(f"Wrote summary: {out_csv}")
+print("Preview:")
+for r in rows[:20]:
+    print(r["imp"], r["TCRbridge_score"], r["tcr_id"], r["source_file"])
+PY
+
+echo "==> Summary saved to: $SUMMARY_CSV"
